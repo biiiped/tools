@@ -1,169 +1,204 @@
 #!/usr/bin/env python3
 """
-split_shots.py
+stitch_videos.py
 
-Run this script and a file-explorer window will pop up asking you to pick
-a movie. It will then:
-  1. Detect shot/scene boundaries in it (using PySceneDetect).
-  2. Create a folder next to the movie (named "<movie_name>_shots").
-  3. Split the movie into one .mp4 file per shot inside that folder.
+Asks you for a folder, finds every video file in it, and stitches them
+together (in name order) into a single .mp4 saved right next to the folder.
 
 Requirements:
-    pip install scenedetect[opencv] --break-system-packages
-    ffmpeg must be installed and available on your PATH
-    (Windows: https://ffmpeg.org/download.html, Mac: brew install ffmpeg,
-     Linux: sudo apt install ffmpeg)
-    tkinter (usually bundled with Python; on Linux you may need:
-     sudo apt install python3-tk)
+    - Python 3.8+
+    - ffmpeg installed and available on your PATH
+      (Windows: https://ffmpeg.org/download.html, then add to PATH
+       macOS:   brew install ffmpeg
+       Linux:   sudo apt install ffmpeg)
+    - tkinter (usually included with Python) for the folder-picker popup.
+      If tkinter isn't available, the script just asks you to type/paste
+      the folder path instead.
 
 Usage:
-    python split_shots.py
-        -> opens a file picker, then processes the chosen movie
-    python split_shots.py --threshold 20 --detector adaptive
-        -> same, but with custom detection settings
-    python split_shots.py "/path/to/movie.mp4"
-        -> skips the file picker if you pass a path directly
+    python stitch_videos.py
 """
 
-import argparse
-import shutil
+import os
+import re
+import subprocess
 import sys
-from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox
+import tempfile
 
-from scenedetect import open_video, SceneManager
-from scenedetect.detectors import ContentDetector, AdaptiveDetector
-from scenedetect.video_splitter import split_video_ffmpeg
-
-
-def pick_movie_file() -> str:
-    """Open a native file-explorer dialog and return the chosen movie path."""
-    root = tk.Tk()
-    root.withdraw()          # hide the empty root window
-    root.attributes("-topmost", True)  # bring the dialog to the front
-
-    path = filedialog.askopenfilename(
-        title="Select a movie to split into shots",
-        filetypes=[
-            ("Video files", "*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.wmv"),
-            ("All files", "*.*"),
-        ],
-    )
-    root.destroy()
-    return path
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v",
+    ".flv", ".wmv", ".mpg", ".mpeg", ".3gp", ".ts",
+}
 
 
-def detect_shots(video_path: str, detector_name: str, threshold: float, min_scene_len: float):
-    video = open_video(video_path)
-    scene_manager = SceneManager()
+def natural_key(s: str):
+    """Sort 'clip2' before 'clip10' instead of alphabetically."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
-    # min_scene_len is given in seconds; PySceneDetect wants frames or a
-    # FrameTimecode, so we let it interpret a float as seconds via base_timecode.
-    min_len_frames = max(1, int(min_scene_len * video.frame_rate))
 
-    if detector_name == "adaptive":
-        detector = AdaptiveDetector(min_scene_len=min_len_frames)
-    else:
-        detector = ContentDetector(threshold=threshold, min_scene_len=min_len_frames)
+def ask_for_folder() -> str:
+    """Try a native folder-picker dialog; fall back to typed input."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
 
-    scene_manager.add_detector(detector)
-    scene_manager.detect_scenes(video, show_progress=True)
-    return scene_manager.get_scene_list()
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        folder = filedialog.askdirectory(title="Select the folder of videos to stitch")
+        root.destroy()
+        if folder:
+            return folder
+    except Exception:
+        pass
+
+    # Fallback: plain console prompt
+    folder = input("Enter the path to the folder containing your videos: ").strip().strip('"')
+    return folder
+
+
+def find_videos(folder: str):
+    files = [
+        f for f in os.listdir(folder)
+        if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
+        and os.path.isfile(os.path.join(folder, f))
+    ]
+    files.sort(key=natural_key)
+    return [os.path.join(folder, f) for f in files]
+
+
+def check_ffmpeg():
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        sys.exit(
+            "ERROR: ffmpeg was not found on your PATH.\n"
+            "Install it first (see the comment at the top of this script)."
+        )
+
+
+def has_audio_stream(video: str) -> bool:
+    """Return True if the file has at least one audio stream."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        video,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return bool(result.stdout.strip())
+
+
+def stitch(videos, output_path, log_dir):
+    """
+    Concatenate videos by re-encoding them to a common format first.
+    This is slower than a raw stream copy, but it works even when the
+    clips have different resolutions/codecs/frame rates, which is the
+    usual reason a naive concat fails.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        normalized = []
+        for i, video in enumerate(videos):
+            out = os.path.join(tmp, f"norm_{i:04d}.ts")
+            print(f"[{i + 1}/{len(videos)}] Normalizing: {os.path.basename(video)}")
+
+            video_filter = (
+                "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1"
+            )
+
+            if has_audio_stream(video):
+                cmd = [
+                    "ffmpeg", "-y", "-i", video,
+                    "-vf", video_filter,
+                    "-r", "30",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-ar", "48000", "-b:a", "192k",
+                    "-f", "mpegts",
+                    out,
+                ]
+            else:
+                # No audio track in the source: synthesize silence so every
+                # normalized clip has a matching audio stream for concat.
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video,
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-shortest",
+                    "-vf", video_filter,
+                    "-r", "30",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-ar", "48000", "-b:a", "192k",
+                    "-f", "mpegts",
+                    out,
+                ]
+
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if result.returncode != 0:
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(
+                    log_dir, f"error_{i:04d}_{os.path.basename(video)}.log"
+                )
+                with open(log_path, "wb") as f:
+                    f.write(result.stderr)
+                print(f"  WARNING: failed to process this file, skipping it.")
+                print(f"  Full ffmpeg log saved to: {log_path}")
+                tail = result.stderr.decode(errors="ignore").strip().splitlines()[-5:]
+                for line in tail:
+                    print(f"    {line}")
+                continue
+            normalized.append(out)
+
+        if not normalized:
+            sys.exit("ERROR: no video could be processed successfully.")
+
+        print("Concatenating everything into the final file...")
+        concat_input = "concat:" + "|".join(normalized)
+        cmd = [
+            "ffmpeg", "-y", "-i", concat_input,
+            "-c:v", "copy", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
+            output_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            sys.exit(
+                "ERROR: final concatenation step failed.\n"
+                + result.stderr.decode(errors="ignore")[-1500:]
+            )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Split a movie into one mp4 per shot.")
-    parser.add_argument(
-        "movie",
-        nargs="?",
-        default=None,
-        help="Path to the movie file. If omitted, a file-explorer dialog opens to pick one.",
-    )
-    parser.add_argument(
-        "--detector",
-        choices=["content", "adaptive"],
-        default="content",
-        help="Detection algorithm. 'content' = classic cut detection (default). "
-             "'adaptive' = better for fast pans/camera motion.",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=27.0,
-        help="Sensitivity for the 'content' detector. Lower = more cuts detected. Default 27.0.",
-    )
-    parser.add_argument(
-        "--min-length",
-        type=float,
-        default=0.6,
-        dest="min_length",
-        help="Minimum shot length in seconds, to avoid tiny false-positive cuts. Default 0.6.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Optional custom output folder. Defaults to '<movie_name>_shots' next to the movie.",
-    )
-    args = parser.parse_args()
+    check_ffmpeg()
 
-    movie_arg = args.movie
-    if not movie_arg:
-        movie_arg = pick_movie_file()
-        if not movie_arg:
-            sys.exit("No file selected. Exiting.")
+    folder = ask_for_folder()
+    if not folder or not os.path.isdir(folder):
+        sys.exit(f"'{folder}' is not a valid folder.")
+    folder = os.path.abspath(folder)
 
-    movie_path = Path(movie_arg).expanduser().resolve()
-    if not movie_path.is_file():
-        sys.exit(f"Error: file not found: {movie_path}")
+    videos = find_videos(folder)
+    if not videos:
+        sys.exit(f"No video files found in: {folder}")
 
-    if shutil.which("ffmpeg") is None:
-        sys.exit(
-            "Error: ffmpeg was not found on your PATH.\n"
-            "Install it first (e.g. 'brew install ffmpeg' or "
-            "'sudo apt install ffmpeg' or download from ffmpeg.org)."
-        )
+    print(f"Found {len(videos)} video(s):")
+    for v in videos:
+        print(f"  - {os.path.basename(v)}")
 
-    output_dir = (
-        Path(args.output_dir).expanduser().resolve()
-        if args.output_dir
-        else movie_path.parent / f"{movie_path.stem}_shots"
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Output mp4 goes beside the folder (i.e. in its parent directory),
+    # named after the folder itself.
+    parent_dir = os.path.dirname(folder)
+    folder_name = os.path.basename(folder)
+    output_path = os.path.join(parent_dir, f"{folder_name}_stitched.mp4")
+    log_dir = os.path.join(parent_dir, f"{folder_name}_stitch_errors")
 
-    print(f"Analyzing '{movie_path.name}' for shot boundaries...")
-    scene_list = detect_shots(
-        str(movie_path),
-        detector_name=args.detector,
-        threshold=args.threshold,
-        min_scene_len=args.min_length,
-    )
+    stitch(videos, output_path, log_dir)
 
-    if not scene_list:
-        sys.exit("No shots detected. Try lowering --threshold or using --detector adaptive.")
-
-    print(f"Detected {len(scene_list)} shots. Splitting into '{output_dir}'...")
-
-    # This produces files like: <movie_stem>-Scene-001.mp4, -Scene-002.mp4, ...
-    split_video_ffmpeg(
-        str(movie_path),
-        scene_list,
-        output_dir=str(output_dir),
-        show_progress=True,
-    )
-
-    print(f"Done. {len(scene_list)} shot files written to: {output_dir}")
-
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(
-            "Done",
-            f"{len(scene_list)} shots extracted.\n\nSaved to:\n{output_dir}",
-        )
-        root.destroy()
-    except tk.TclError:
-        pass  # no display available (e.g. headless server) — console message is enough
+    print(f"\nDone! Stitched video saved to:\n{output_path}")
 
 
 if __name__ == "__main__":
